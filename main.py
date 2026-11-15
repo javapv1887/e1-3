@@ -3,16 +3,26 @@
 import json
 import math
 import re
+from collections import Counter
 from pathlib import Path
 from time import perf_counter_ns
 
 
 DATA_PATH = Path(__file__).resolve().with_name("data.json")
 EPSILON = 1e-9
-REPETITIONS = 1000
+REPETITIONS = 10
 JSON_SIZES = (5, 13, 25)
+STANDARD_LABELS = ("Cross", "X")
 FILTER_LABELS = {"cross": "Cross", "x": "X"}
 EXPECTED_LABELS = {"+": "Cross", "x": "X", "Cross": "Cross", "X": "X"}
+
+
+def normalize_label(value, aliases, field):
+    """원본 라벨을 검증하고 입력 종류에 맞는 표준 라벨을 반환한다."""
+    if not isinstance(value, str) or value not in aliases:
+        allowed = ", ".join(repr(alias) for alias in aliases)
+        raise ValueError(f"{field}에는 {allowed} 중 하나가 필요합니다.")
+    return aliases[value]
 
 
 def mac(pattern, kernel):
@@ -102,11 +112,17 @@ def load_filter_groups(raw_filters):
             if not isinstance(raw_group, dict):
                 raise ValueError("필터 그룹은 JSON 객체여야 합니다.")
             group = {}
-            for field, label in FILTER_LABELS.items():
-                if field not in raw_group:
-                    raise ValueError(f"{field} 필터가 없습니다.")
-                matrix = validate_matrix(raw_group[field], size, f"{label} 필터")
+            for field, values in raw_group.items():
+                if field not in FILTER_LABELS:
+                    continue
+                label = normalize_label(field, FILTER_LABELS, "필터 키")
+                if label in group:
+                    raise ValueError(f"{label} 필터가 중복되었습니다.")
+                matrix = validate_matrix(values, size, f"{label} 필터")
                 group[label] = flatten_matrix(matrix)
+            for label in STANDARD_LABELS:
+                if label not in group:
+                    raise ValueError(f"{label} 필터가 없습니다.")
         except ValueError as error:
             errors[key] = str(error)
             print(f"{key}: 필터 오류 ({error})")
@@ -117,6 +133,7 @@ def load_filter_groups(raw_filters):
 
 
 def average_mac_ms(operation, pattern, kernel):
+    operation(pattern, kernel)  # 워밍업 1회는 측정에서 제외한다.
     elapsed_ns = 0
     for _ in range(REPETITIONS):
         start = perf_counter_ns()
@@ -177,7 +194,7 @@ def run_manual():
 
 
 def analyze_case(case_id, case, filter_groups, filter_errors):
-    """케이스를 검증하고 분석한다. 실패하면 요약용 사유를 반환한다."""
+    """케이스를 검증하고 분석한다. 실패하면 원인 유형과 상세 사유를 반환한다."""
     print(f"\n[{case_id}]")
     try:
         match = re.fullmatch(r"(size_([1-9][0-9]*))_[0-9]+", case_id)
@@ -191,33 +208,36 @@ def analyze_case(case_id, case, filter_groups, filter_errors):
         if not isinstance(case, dict):
             raise ValueError("패턴 항목은 JSON 객체여야 합니다.")
         pattern = validate_matrix(case.get("input"), int(size_text), "입력 패턴")
-        raw_expected = case.get("expected")
-        if not isinstance(raw_expected, str) or raw_expected not in EXPECTED_LABELS:
-            raise ValueError("expected에는 '+', 'x', 'Cross', 'X' 중 하나가 필요합니다.")
-        expected = EXPECTED_LABELS[raw_expected]
+        expected = normalize_label(case.get("expected"), EXPECTED_LABELS, "expected")
+    except ValueError as error:
+        print(f"FAIL ({error})")
+        return "스키마/데이터", str(error)
 
-        group = filter_groups[filter_key]
-        flat_pattern = flatten_matrix(pattern)
-        score_cross = mac_flat(flat_pattern, group["Cross"])
-        score_x = mac_flat(flat_pattern, group["X"])
-        print(f"Cross 점수: {score_cross}")
-        print(f"X 점수: {score_x}")
+    group = filter_groups[filter_key]
+    flat_pattern = flatten_matrix(pattern)
+    score_cross = mac_flat(flat_pattern, group["Cross"])
+    score_x = mac_flat(flat_pattern, group["X"])
+    print(f"Cross 점수: {score_cross}")
+    print(f"X 점수: {score_x}")
+    try:
         result = classify(score_cross, score_x, "Cross", "X")
     except ValueError as error:
         print(f"FAIL ({error})")
-        return str(error)
+        return "수치 범위", str(error)
 
     if result == expected:
         print(f"판정: {result} | expected: {expected} | PASS")
         return None
 
     if result == "UNDECIDED":
+        category = "동점"
         gap = abs(score_cross - score_x)
         reason = f"동점 처리 (점수 차이 {gap:.3g} < {EPSILON:g})"
     else:
+        category = "기대 라벨 불일치"
         reason = f"판정 {result}과 기대 라벨 {expected} 불일치"
     print(f"판정: {result} | expected: {expected} | FAIL ({reason})")
-    return reason
+    return category, reason
 
 
 def run_json(path):
@@ -237,18 +257,26 @@ def run_json(path):
     failures = []
     print("\n[패턴 분석]")
     for case_id, case in patterns.items():
-        reason = analyze_case(case_id, case, groups, filter_errors)
-        if reason is not None:
-            failures.append((case_id, reason))
+        failure = analyze_case(case_id, case, groups, filter_errors)
+        if failure is not None:
+            category, reason = failure
+            failures.append((case_id, category, reason))
 
     print_benchmark(benchmark_sample(size) for size in (3,) + JSON_SIZES)
+    total = len(patterns)
+    passed = total - len(failures)
+    pass_rate = f"{passed / total:.1%}" if total else "해당 없음"
     print("\n[결과 요약]")
-    print(f"총 테스트: {len(patterns)}개")
-    print(f"통과: {len(patterns) - len(failures)}개")
+    print(f"총 테스트: {total}개")
+    print(f"통과: {passed}개")
     print(f"실패: {len(failures)}개")
+    print(f"통과율: {pass_rate}")
     if failures:
+        counts = Counter(category for _, category, _ in failures)
+        breakdown = ", ".join(f"{category} {count}개" for category, count in counts.items())
+        print(f"실패 원인별 집계: {breakdown}")
         print("\n실패 케이스")
-        for case_id, reason in failures:
+        for case_id, _, reason in failures:
             print(f"- {case_id}: {reason}")
     return 0
 
